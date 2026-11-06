@@ -14,7 +14,6 @@ from pathlib import Path
 import numpy as np
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.utils.validation import check_is_fitted
-from utils.llm_request_options import normalize_request_options, normalize_response_model_names
 
 # Compatibility aliases: legacy serialized checkpoints and scripts may import this module via
 # performance_router or utils.performance_router.
@@ -297,7 +296,7 @@ class PerformanceAwareMultiLLMRouter:
     ):
         """Filter candidate APIs within delta of the best predicted F1, then select the one with the lowest predicted latency.
 
-        When gate_aware=True (Section 3.3.1, Eq. 7), clusters whose C1 retrieval gate abstains
+        When gate_aware=True (Section III-C1, Eq. 7), clusters whose C1 retrieval gate abstains
         (gate_accepted=False or retrieval_count == 0) are dispatched directly to fast_model
         (or default_model), while gate-accepted clusters are routed via the GBR Pareto selector.
         """
@@ -421,28 +420,3 @@ class PerformanceAwareMultiLLMRouter:
         except (KeyError, TypeError, ValueError, AttributeError) as exc:
             raise ValueError(f"Invalid performance checkpoint; retrain: {exc}") from exc
         return router, metadata
-
-
-
-
-
-
-
-
-
-
-def api_config_fingerprint(api_id, config):
-    """Compute a deterministic fingerprint for the candidate endpoint, model, and generation configuration without including secrets."""
-    import hashlib
-    import os
-    fields = ("model", "model_version", "temperature", "reasoning_effort", "max_tokens",
-              "max_tokens_cap", "request_timeout", "max_retries", "length_retry_limit", "seed")
-    identity = {key: config.get(key) for key in fields}
-    for key, normalize in (("request_options", normalize_request_options),
-                           ("response_model_names", normalize_response_model_names)):
-        value = normalize(config.get(key))
-        if value:
-            identity[key] = value
-    identity["api_id"] = api_id
-    identity["endpoint_hash"] = hashlib.sha256(os.path.expandvars(str(config.get("api_url", ""))).encode()).hexdigest()
-    return hashlib.sha256(json.dumps(identity, sort_keys=True, allow_nan=False).encode()).hexdigest()

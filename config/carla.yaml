@@ -1,0 +1,64 @@
+# Carla cold-start configuration template
+
+dataset: "carla"
+feat_dim: 256
+fps: 20
+ngpu: 1
+seed: 0
+sort_record: True
+use_plate: False
+
+# Prepared dataset and road-network assets
+record_file: "./data/carla/records.json"
+road_graph_file: "./cache_data/carla/road_graph.pkl"
+cid_rid_correspondence_file: "./cache_data/carla/cid_rid_correspondence.pkl"
+rid_shortest_path_results_file: "./cache_data/carla/rid_shortest_path_result.pkl"
+cam_xy_dict_file: "./cache_data/carla/cam_xy_dict.pkl"
+road_node_traj_gt_file: "./cache_data/carla/traj_gt.pkl"
+
+# Upstream clustering
+sig_cluster:
+  useFloat16: False
+  sim_thres: 0.75
+  weights: [1.0, 0.0, 0.0]
+  topK: 128
+  query_num: 2048
+clustering_res_file: "./outputs/carla/clustering_res.pkl"
+
+# Kinematic constraints and evaluation parameters
+max_speed_mps: 25.0
+max_span_m: 1200.0
+min_dwell_sec: 30.0
+detour_ratio_threshold: 1.05
+detour_excess_m: 15.0
+enable_dp_corridor_separation: True
+max_intersection_cam_id: 426
+v_stop_mps: 5.0
+local_gate: "g5_kinematic_boundary_v1"
+scale_coef: [0.05, 0.05, 0.05]
+
+# LLM API providers (OpenAI & Alibaba Cloud DashScope)
+llm_client:
+  api_key: "${OPENAI_API_KEY}"
+  api_url: "https://api.openai.com/v1"
+  providers:
+    openai:
+      api_url: "https://api.openai.com/v1"
+      api_key: "${OPENAI_API_KEY}"
+    dashscope:
+      api_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+      api_key: "${DASHSCOPE_API_KEY}"
+  default_model: "gpt-4.1-nano"
+  default_temperature: 0.0
+  default_max_tokens: 8192
+  max_tokens_cap: 8192
+  max_retries: 1
+  length_retry_limit: 0
+  request_timeout: 180
+
+# Multi-LLM router settings
+llm_routing:
+  candidate_models: ["gpt-4.1-nano", "gpt-4.1", "qwen3.5-plus"]
+  default_model: "gpt-4.1-nano"
+  router_ckpt_file: ""
+  quality_tolerance: 0.01

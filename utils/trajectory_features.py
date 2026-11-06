@@ -46,14 +46,14 @@ def build_observation_features(camera_trace, road_graph=None, camera_to_node=Non
             variance = sum((value - mean) ** 2 for value in gaps) / len(gaps)
             result["time_gap"] = mean
             result["time_gap_cv"] = math.sqrt(variance) / abs(mean) if mean else (0. if not any(gaps) else None)
-            if time_unit in {"s", "seconds"}:
+            if time_unit in {"s", "sec", "second", "seconds"}:
                 result["missing_ratio"] = sum(value > 30 for value in gaps) / len(gaps)
     # Legacy branching_score serves as an observation uniqueness proxy.
     road_ids = [node for node, _ in rid_trace] if rid_trace else cameras
     if cameras:
         result["branching_score"] = (len(set(cameras)) / len(cameras) +
                                       len(set(road_ids)) / len(road_ids)) / 2
-    if coordinate_unit in {"m", "meters", "metres"} and cameras:
+    if coordinate_unit in {"m", "meter", "metre", "meters", "metres"} and cameras:
         points = [(cam_xy_dict or {}).get(camera) for camera in cameras]
         coords = []
         for point in points:

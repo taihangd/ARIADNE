@@ -332,7 +332,7 @@ def build_cluster_corridor_subgraph(
     shortest_paths=None,
     k_hop=0,
 ):
-    """Construct the local corridor subgraph G_q subset G for a cluster query (Section 3.3.2, Eq. 8).
+    """Construct the local corridor subgraph G_q subset G for a cluster query (Section III-C2, Eq. 8).
 
     Args:
         context: Either a cluster track context dict or a raw camera_trace list [(cam_id, ts), ...].
@@ -500,9 +500,10 @@ def evaluate_cluster_invocation_gate(
     min_dwell_sec=30.0,
     max_span_m=1200.0,
     detour_ratio_threshold=1.05,
+    detour_excess_m=0.0,
     candidate_bindings=None,
 ):
-    """Evaluate C1 Level-1 cluster invocation gate (gamma_inv in Section 3.1).
+    """Evaluate C1 Level-1 cluster invocation gate (gamma_inv in Section III-A1).
 
     Checks whether the raw camera observation sequence exhibits any of the three conditions:
     (a) Inter-observation topological/kinematic conflict:
@@ -511,7 +512,8 @@ def evaluate_cluster_invocation_gate(
         - implied road-network speed exceeding max_speed_mps (v_imp > v_max), or
         - long-span observation gap d_SP(v_i, v_{i+1}) > max_span_m (default 1200.0 m);
     (b) Three-point mid-block detour anomaly:
-        - d_SP(v_{i-1}, v_i) + d_SP(v_i, v_{i+1}) > detour_ratio_threshold * d_SP(v_{i-1}, v_{i+1});
+        - d_SP(v_{i-1}, v_i) + d_SP(v_i, v_{i+1}) > detour_ratio_threshold * d_SP(v_{i-1}, v_{i+1})
+          with excess path length exceeding detour_excess_m (default 0.0 m; 15.0 m on short-block grids);
     (c) Multi-candidate binding ambiguity or prolonged same-camera dwell:
         - |V(c_i)| > 1 in candidate_bindings, or c_i == c_{i+1} with dt > min_dwell_sec.
     """
@@ -522,6 +524,7 @@ def evaluate_cluster_invocation_gate(
     dwell_threshold = float(min_dwell_sec)
     span_threshold = None if max_span_m is None else float(max_span_m)
     detour_threshold = None if detour_ratio_threshold is None else float(detour_ratio_threshold)
+    excess_threshold = max(0.0, float(detour_excess_m or 0.0))
     merged_rule_cfg = dict(rule_config or {})
     if max_speed_mps is not None:
         merged_rule_cfg["max_speed_mps"] = float(max_speed_mps)
@@ -592,11 +595,17 @@ def evaluate_cluster_invocation_gate(
                 continue
             rebuilt_02, err_02 = _validated_path(road_graph, entry_02, u0, u2)
             d02 = rebuilt_02[2] if err_02 is None and rebuilt_02 is not None else None
-            if d02 is not None and d02 > 0.0 and (d01 + d12) > detour_threshold * d02:
+            if (
+                d02 is not None
+                and d02 > 0.0
+                and (d01 + d12) > detour_threshold * d02
+                and (d01 + d12 - d02) > excess_threshold
+            ):
                 conflict_segments.append({
                     "segment_index": idx,
                     "trigger": "three_point_detour_anomaly",
                     "detour_ratio": (d01 + d12) / d02,
+                    "detour_excess_m": (d01 + d12) - d02,
                     "nodes": (u0, u1, u2),
                 })
 
@@ -627,6 +636,7 @@ def evaluate_cluster_invocation_gate(
         "min_dwell_sec": dwell_threshold,
         "max_span_m": span_threshold,
         "detour_ratio_threshold": detour_threshold,
+        "detour_excess_m": excess_threshold,
     }
 
 
@@ -640,8 +650,9 @@ def execute_three_tier_corridor_verification(
     max_span_m=1200.0,
     min_dwell_sec=30.0,
     detour_ratio_threshold=1.05,
+    detour_excess_m=0.0,
 ):
-    """Execute C2 three-tier deterministic corridor verification and timestamp interpolation (Section 3.2.2, Eq. 5).
+    """Execute C2 three-tier deterministic corridor verification and timestamp interpolation (Section III-B2, Eq. 5).
 
     Args:
         observations: List of (road_node_id, timestamp_sec) tuples representing anchor observations.
@@ -652,6 +663,7 @@ def execute_three_tier_corridor_verification(
         max_span_m: Optional maximum corridor span d_max in metres (default 1200.0 m).
         min_dwell_sec: Dwell collapse threshold Delta t_dwell (default 30.0 s).
         detour_ratio_threshold: Optional three-point detour ratio threshold eta_detour (default 1.05).
+        detour_excess_m: Minimum excess path length Delta_detour in metres required to trigger a detour spike (default 0.0 m).
     """
     import networkx as nx
 
@@ -661,6 +673,7 @@ def execute_three_tier_corridor_verification(
     sp_dict = shortest_paths if isinstance(shortest_paths, dict) else {}
     span_cap = None if max_span_m is None else float(max_span_m)
     detour_cap = None if detour_ratio_threshold is None else float(detour_ratio_threshold)
+    excess_cap = max(0.0, float(detour_excess_m or 0.0))
 
     def _span_ok(dist_m):
         return span_cap is None or float(dist_m) <= span_cap
@@ -777,6 +790,7 @@ def execute_three_tier_corridor_verification(
                     and _span_ok(sp_bypass[2])
                     and (sp_bypass[2] / dt2) <= float(max_speed_mps)
                     and (sp[2] + sp_next[2]) > detour_cap * sp_bypass[2]
+                    and (sp[2] + sp_next[2] - sp_bypass[2]) > excess_cap
                 ):
                     is_detour_spike = True
             if not is_detour_spike and sp is not None and _span_ok(sp[2]) and (sp[2] / dt) <= float(max_speed_mps):
@@ -828,3 +842,159 @@ def execute_three_tier_corridor_verification(
         "tier_counts": tier_counts,
         "unresolved_count": unresolved,
     }
+
+
+def extract_kinematic_dp_corridors(
+    camera_trace,
+    *,
+    camera_to_node,
+    shortest_paths,
+    road_graph=None,
+    max_intersection_cam_id=None,
+    local_dist_m=380.0,
+    stitch_dist_m=900.0,
+    dwell_merge_sec=45.0,
+    min_raw_support=4,
+):
+    """Separate kinematically consistent single-vehicle sub-corridors via two-stage DP (Section III-B1).
+
+    Extracts smooth local chains (d_SP <= local_dist_m), stitches compatible non-overlapping
+    subchains (d_SP <= stitch_dist_m), and collapses consecutive same-node dwell detections
+    so co-clustered lookalike vehicles do not cross-jump across disjoint streets.
+    """
+    import networkx as nx
+
+    def _sp_dist(u, v):
+        if u == v:
+            return 0.0
+        if isinstance(shortest_paths, dict):
+            entry = shortest_paths.get((u, v))
+            if isinstance(entry, (list, tuple)) and len(entry) >= 3 and entry[0]:
+                return float(entry[2])
+            if isinstance(entry, (int, float)):
+                return float(entry)
+            sub = shortest_paths.get(u)
+            if isinstance(sub, dict) and v in sub:
+                return float(sub[v])
+        if road_graph is not None:
+            try:
+                return float(nx.shortest_path_length(road_graph, u, v, weight="length"))
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                return 1e9
+        return 1e9
+
+    pts = []
+    for idx, (cam_raw, tm_raw) in enumerate(camera_trace or []):
+        cam = int(cam_raw)
+        if max_intersection_cam_id is not None and cam >= int(max_intersection_cam_id):
+            continue
+        if cam not in camera_to_node:
+            continue
+        pts.append((idx, cam, float(tm_raw), int(camera_to_node[cam])))
+    pts.sort(key=lambda x: x[2])
+    if not pts:
+        return []
+
+    remaining = list(range(len(pts)))
+    subchains = []
+    min_chain_len = max(2, min(4, int(min_raw_support)))
+    while len(remaining) >= min_chain_len:
+        n = len(remaining)
+        dp = [1.0] * n
+        prev = [-1] * n
+        for j in range(n):
+            _, _, tj, rj = pts[remaining[j]]
+            for i in range(j):
+                _, _, ti, ri = pts[remaining[i]]
+                dt = tj - ti
+                if dt < 0.0 or dt > 180.0:
+                    continue
+                d = _sp_dist(ri, rj)
+                if d <= float(local_dist_m) and d <= 32.0 * dt + 85.0:
+                    penalty = min(0.85, (d / max(float(local_dist_m), 1.0)) + (dt / 200.0))
+                    score = dp[i] + 1.0 - penalty
+                    if score > dp[j]:
+                        dp[j] = score
+                        prev[j] = i
+        best_end = int(max(range(n), key=lambda k: dp[k]))
+        path_idx = []
+        cur = best_end
+        while cur != -1:
+            path_idx.append(remaining[cur])
+            cur = prev[cur]
+        path_idx.reverse()
+        if len(path_idx) < min_chain_len:
+            break
+        subchains.append([pts[k] for k in path_idx])
+        used = set(path_idx)
+        remaining = [k for k in remaining if k not in used]
+
+    subchains.sort(key=lambda ch: ch[0][2])
+    merged = True
+    while merged:
+        merged = False
+        best_pair = None
+        best_cost = 1e18
+        for i in range(len(subchains)):
+            for j in range(len(subchains)):
+                if i == j:
+                    continue
+                _, _, t_end, r_end = subchains[i][-1]
+                _, _, t_start, r_start = subchains[j][0]
+                dt = t_start - t_end
+                if dt < 0.0 or dt > 200.0:
+                    continue
+                d = _sp_dist(r_end, r_start)
+                if d <= float(stitch_dist_m) and d <= 18.0 * dt + 95.0:
+                    cost = abs(d - 8.0 * dt) + 0.5 * d
+                    if cost < best_cost:
+                        best_cost = cost
+                        best_pair = (i, j)
+        if best_pair is not None:
+            i, j = best_pair
+            new_ch = subchains[i] + subchains[j]
+            subchains = [ch for k, ch in enumerate(subchains) if k not in (i, j)] + [new_ch]
+            subchains.sort(key=lambda ch: ch[0][2])
+            merged = True
+
+    valid_subchains = [ch for ch in subchains if len(ch) >= int(min_raw_support)]
+    if not valid_subchains and subchains:
+        valid_subchains = [max(subchains, key=len)]
+    valid_subchains.sort(key=len, reverse=True)
+
+    corridors = []
+    for cid_idx, raw_ch in enumerate(valid_subchains):
+        anchors = []
+        cur_cam, cur_node = raw_ch[0][1], raw_ch[0][3]
+        cur_tms = [raw_ch[0][2]]
+        cur_idxs = [raw_ch[0][0]]
+        for ridx, rcam, tm, rnode in raw_ch[1:]:
+            if rnode == cur_node and (tm - cur_tms[-1]) <= float(dwell_merge_sec):
+                cur_tms.append(tm)
+                cur_idxs.append(ridx)
+            else:
+                anchors.append({
+                    "camera_id": int(cur_cam),
+                    "node": int(cur_node),
+                    "time": float(sum(cur_tms) / len(cur_tms)),
+                    "raw_count": len(cur_idxs),
+                    "raw_indices": list(cur_idxs),
+                })
+                cur_cam, cur_node = rcam, rnode
+                cur_tms = [tm]
+                cur_idxs = [ridx]
+        anchors.append({
+            "camera_id": int(cur_cam),
+            "node": int(cur_node),
+            "time": float(sum(cur_tms) / len(cur_tms)),
+            "raw_count": len(cur_idxs),
+            "raw_indices": list(cur_idxs),
+        })
+        corridors.append({
+            "corridor_id": cid_idx,
+            "raw_support": len(raw_ch),
+            "camera_trace": [(a["camera_id"], a["time"]) for a in anchors],
+            "rid_trace": [(a["node"], a["time"]) for a in anchors],
+            "anchors": anchors,
+        })
+    return corridors

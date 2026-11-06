@@ -1,4 +1,4 @@
-# Example dataset and runtime configuration template (UrbanVehicle)
+# UrbanVehicle configuration template
 
 dataset: "uv"
 feat_dim: 256
@@ -8,22 +8,15 @@ seed: 0
 sort_record: True
 use_plate: True
 
-# Dataset input paths (replace with local dataset locations)
-road_map_file: "./data/uv/map.json"
-cam_file: "./data/uv/cameras.json"
+# Prepared dataset and road-network assets
 record_file: "./data/uv/records.json"
-road_node_traj_gt_path: "./data/uv/traj_gt/"
-frame_thres: Null
-
-# Preprocessed graph and shortest-path cache paths
-road_node_xy_info_file: "./cache_data/uv/road_node_xy_info.pkl"
 road_graph_file: "./cache_data/uv/road_graph.pkl"
 cid_rid_correspondence_file: "./cache_data/uv/cid_rid_correspondence.pkl"
 rid_shortest_path_results_file: "./cache_data/uv/rid_shortest_path_result.pkl"
 cam_xy_dict_file: "./cache_data/uv/cam_xy_dict.pkl"
 road_node_traj_gt_file: "./cache_data/uv/traj_gt.pkl"
 
-# Upstream visual-spatiotemporal clustering (SigCluster)
+# Upstream clustering
 sig_cluster:
   useFloat16: False
   sim_thres: 0.85
@@ -32,17 +25,18 @@ sig_cluster:
   query_num: 4096
 clustering_res_file: "./outputs/uv/clustering_res.pkl"
 
-# C1 & C2 kinematic constraints and evaluation parameters
+# Kinematic constraints and evaluation parameters
 max_speed_mps: 25.0
 max_span_m: 1200.0
 min_dwell_sec: 30.0
 detour_ratio_threshold: 1.05
+detour_excess_m: 0.0
+enable_dp_corridor_separation: False
 v_stop_mps: 5.0
 local_gate: "g5_kinematic_boundary_v1"
-lam: 0.5
 scale_coef: [0.04267, 0.04267, 0.04267]
 
-# Official provider LLM client settings (OpenAI & Alibaba Cloud DashScope)
+# LLM API providers (OpenAI & Alibaba Cloud DashScope)
 llm_client:
   api_key: "${OPENAI_API_KEY}"
   api_url: "https://api.openai.com/v1"
@@ -61,7 +55,7 @@ llm_client:
   length_retry_limit: 0
   request_timeout: 180
 
-# C3 difficulty-aware multi-LLM router settings
+# Multi-LLM router settings
 llm_routing:
   candidate_models: ["gpt-4.1-nano", "gpt-4.1", "qwen3.5-plus"]
   default_model: "gpt-4.1-nano"

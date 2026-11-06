@@ -1,4 +1,4 @@
-"""Main pipeline entrypoint for cluster-level road-network trajectory recovery (C1 + C2 + C3)."""
+"""Main pipeline entrypoint for road-network trajectory recovery."""
 
 from __future__ import annotations
 
@@ -12,15 +12,7 @@ from typing import Any, Dict
 
 import numpy as np
 
-from cluster_algorithm import SigCluster
-from common import (
-    calc_boundary_and_center_xy,
-    construct_road_network_urbanvehicle,
-    gen_cam_pos_dict_urbanvehicle,
-    load_road_network_urbanvehicle,
-    load_road_node_traj_gt,
-    merge_tm_adj_points,
-)
+from common import complete_trajectories_fast, merge_tm_adj_points, preprocess_paths_with_length
 from eval import eval_trajs, evaluate, gen_vid2cid
 from load_data import load_car_feat
 from multi_llm_router import PerformanceAwareMultiLLMRouter, build_case_features_from_trace
@@ -32,59 +24,14 @@ from utils.fixed_expert_recovery import (
     build_cluster_corridor_subgraph,
     evaluate_cluster_invocation_gate,
     execute_three_tier_corridor_verification,
+    extract_kinematic_dp_corridors,
     parse_camera_mapping_response,
 )
 from utils.yaml_config_hook import add_config_arguments, flatten_dict, unflatten_dict, yaml_config_hook
 
 
-def preprocess_paths_with_length(shortest_path_results, road_graph):
-    """Precompute cumulative_lengths and total_length for each shortest path."""
-    processed_paths = {}
-    for key, paths in shortest_path_results.items():
-        path_nodes = paths[0]
-        cumulative_lengths = [0.0]
-        total_length = 0.0
-        for u, v in zip(path_nodes[:-1], path_nodes[1:]):
-            edge_data = road_graph[u][v]
-            if "length" in edge_data:
-                length = float(edge_data["length"])
-            elif edge_data:
-                length = float(min(
-                    (d.get("length", 1.0) for d in edge_data.values() if isinstance(d, dict)),
-                    default=1.0,
-                ))
-            else:
-                length = 1.0
-            total_length += length
-            cumulative_lengths.append(total_length)
-        processed_paths[key] = (path_nodes, cumulative_lengths, total_length)
-    return processed_paths
-
-
-def complete_trajectories_fast(cluster_traj_dict, processed_paths):
-    """Interpolate along precomputed shortest paths while preserving every observed endpoint."""
-    completed = {}
-    for label, observations in cluster_traj_dict.items():
-        trajectory = [tuple(observations[0])] if observations else []
-        for start, end in zip(observations, observations[1:]):
-            rid1, t1 = start
-            rid2, t2 = end
-            entry = processed_paths.get((rid1, rid2))
-            if entry is not None:
-                nodes, lengths, total = entry
-                if (nodes and nodes[0] == rid1 and nodes[-1] == rid2
-                        and len(nodes) == len(lengths) and total > 0):
-                    trajectory.extend(
-                        (node, t1 + distance / total * (t2 - t1))
-                        for node, distance in zip(nodes[1:-1], lengths[1:-1])
-                    )
-            trajectory.append((rid2, t2))
-        completed[label] = trajectory
-    return completed
-
-
 def _build_top2_camera_candidates(road_graph, cam_xy_dict, camera_ids):
-    """Compute geometric Top-2 candidate road nodes Gamma_2(c_i) per camera (Section 3.3.2)."""
+    """Compute geometric Top-2 candidate road nodes Gamma_2(c_i) per camera (Section II-A, Section III-C2)."""
     if not isinstance(cam_xy_dict, dict) or road_graph is None:
         return None
     node_xy = [
@@ -104,6 +51,32 @@ def _build_top2_camera_candidates(road_graph, cam_xy_dict, camera_ids):
         if ranked:
             candidates[cam] = [node for _, node in ranked]
     return candidates or None
+
+
+def _extract_bank_candidate_bindings(active_mapping, active_experience):
+    """Extract multi-candidate bindings B(O_q) when retrieved bank evidence differs from Top-1."""
+    if not isinstance(active_experience, dict):
+        return None
+    bindings = {}
+    for row in active_experience.get("camera_support") or []:
+        if isinstance(row, (list, tuple)) and len(row) >= 3:
+            cam_id = int(row[0])
+            cands = [int(active_mapping[cam_id])] if cam_id in active_mapping else []
+            for ns in row[2] or []:
+                if isinstance(ns, (list, tuple)) and ns:
+                    cands.append(int(ns[0]))
+            if len(set(cands)) > 1:
+                bindings[cam_id] = sorted(set(cands))
+    for row in (active_experience.get("teacher") or {}).get("mapping") or []:
+        if isinstance(row, (list, tuple)) and len(row) >= 2:
+            cam_id, t_node = int(row[0]), int(row[1])
+            cands = set(bindings.get(cam_id, []))
+            if cam_id in active_mapping:
+                cands.add(int(active_mapping[cam_id]))
+            cands.add(t_node)
+            if len(cands) > 1:
+                bindings[cam_id] = sorted(cands)
+    return bindings or None
 
 
 def _build_public_mapping_context(camera_trace, *, road_graph, camera_to_node, cam_xy_dict):
@@ -167,7 +140,10 @@ def _make_llm_road_intent_callable(camera_to_node, cam_xy_dict):
             retrieved_experience=retrieved_experience,
         )
         raw_text = LLMClient.call_llm(prompt, model=model)
-        groups, _, mapping = parse_camera_mapping_response(raw_text, ctx, road_graph=corridor_subgraph)
+        try:
+            groups, _, mapping = parse_camera_mapping_response(raw_text, ctx, road_graph=corridor_subgraph)
+        except Exception:
+            return {"camera_node_choices": {}, "interval_intents": {}}
         obs_id_to_idx = {
             obs["obs_id"]: int(obs["input_index"])
             for obs in ctx.get("observations", [])
@@ -199,46 +175,12 @@ def _make_llm_road_intent_callable(camera_to_node, cam_xy_dict):
     return _call
 
 
-def prep_road_network_urbanvehicle(
-    road_map_file,
-    road_node_xy_info_file,
-    road_graph_pkl_file,
-    cam_file,
-    cam_dict_file,
-):
-    """Prepare the directed road network graph and planar camera coordinates."""
-    road_node_xy_dict, edge_dict = load_road_network_urbanvehicle(road_map_file)
-    boundary_info = calc_boundary_and_center_xy(road_node_xy_dict)
-    if not os.path.exists(road_node_xy_info_file):
-        with open(road_node_xy_info_file, "wb") as f:
-            pickle.dump(
-                [
-                    road_node_xy_dict,
-                    [
-                        boundary_info["min_x"],
-                        boundary_info["min_y"],
-                        boundary_info["max_x"],
-                        boundary_info["max_y"],
-                    ],
-                ],
-                f,
-            )
-    road_graph = construct_road_network_urbanvehicle(
-        road_node_xy_dict, edge_dict, road_graph_pkl_file
-    )
-    cam_dict = gen_cam_pos_dict_urbanvehicle(cam_file, cam_dict_file)
-    return road_graph, cam_dict, boundary_info
-
-
 def load_road_assets(args):
-    """Load directed road network, camera-to-node bindings, and precomputed shortest paths."""
-    road_graph, cam_xy_dict, boundary_info = prep_road_network_urbanvehicle(
-        args.road_map_file,
-        args.road_node_xy_info_file,
-        args.road_graph_file,
-        args.cam_file,
-        args.cam_xy_dict_file,
-    )
+    """Load prepared road-network graph, camera bindings, shortest paths, and ground truth."""
+    with open(args.road_graph_file, "rb") as f:
+        road_graph = pickle.load(f)
+    with open(args.cam_xy_dict_file, "rb") as f:
+        cam_xy_dict = pickle.load(f)
     with open(args.cid_rid_correspondence_file, "rb") as f:
         cid_to_rid = pickle.load(f)
     camera_to_node = (
@@ -248,13 +190,9 @@ def load_road_assets(args):
     )
     with open(args.rid_shortest_path_results_file, "rb") as f:
         shortest_paths = pickle.load(f)
-    traj_gt_dict = load_road_node_traj_gt(
-        args.road_node_traj_gt_file,
-        args.road_node_traj_gt_path,
-        getattr(args, "frame_thres", None),
-        args.fps,
-    )
-    return road_graph, camera_to_node, cam_xy_dict, shortest_paths, traj_gt_dict, boundary_info
+    with open(args.road_node_traj_gt_file, "rb") as f:
+        traj_gt_dict = pickle.load(f)
+    return road_graph, camera_to_node, cam_xy_dict, shortest_paths, traj_gt_dict
 
 
 def recover_cluster_trajectory(
@@ -268,6 +206,7 @@ def recover_cluster_trajectory(
     llm_callable=None,
     experience_bank: Dict[str, Any] | None = None,
     retrieved_experience: Any | None = None,
+    retrieval_similarity: float | None = None,
     gate_accepted: bool = False,
     interval_intents: Dict[int, list] | None = None,
     sp_cache: Dict[Any, Any] | None = None,
@@ -275,63 +214,34 @@ def recover_cluster_trajectory(
     max_span_m: float = 1200.0,
     min_dwell_sec: float = 30.0,
     detour_ratio_threshold: float = 1.05,
+    detour_excess_m: float = 0.0,
+    enable_dp_corridor_separation: bool = False,
+    max_intersection_cam_id: int | None = None,
 ) -> Dict[str, Any]:
-    """Execute the closed-loop C1 -> C3 -> C2 trajectory recovery pipeline (Algorithm 1).
-
-    Stage 1 (C1): Evaluate cluster-level kinematic conflict gate gamma_inv(O_q).
-                  Clean single-corridor clusters (gamma_inv == 0) bypass LLM inference.
-                  For triggered clusters, optionally retrieve and gate transition
-                  experiences via G5^kin when an experience_bank is supplied.
-    Stage 2 (C3): For triggered clusters (gamma_inv == 1), prune the full city graph G
-                  to the lossless corridor subgraph G_q (Eq. 8) over Top-2 camera candidates
-                  Gamma_2(c_i) with 1-hop corridor halo (k_hop=1) and select model mu*(q)
-                  via the gate-aware Pareto router (Eq. 7).
-    Stage 3 (C2): Invoke mu*(q) (when llm_callable is provided) to predict camera-node
-                  bindings, retained track observations, and interval via-nodes, then
-                  execute three-tier bounded Dijkstra verification and edge-proportional
-                  timestamp interpolation (Eq. 5).
-    """
-    merged_cam_trace = sorted(merge_tm_adj_points(list(camera_trace), adj_range=100), key=lambda x: x[1])
+    """Execute the closed-loop C1 -> C3 -> C2 trajectory recovery pipeline (Algorithm 1)."""
     active_mapping = dict(camera_to_node or {})
-    rid_trace = [
-        (int(active_mapping[cam]), float(ts))
-        for cam, ts in merged_cam_trace
-        if cam in active_mapping
-    ]
-    rid_trace = sorted(merge_tm_adj_points(rid_trace, adj_range=100), key=lambda x: x[1])
-
-    # Stage 1 (C1): Cluster-level kinematic invocation gate gamma_inv(O_q)
-    gate_info = evaluate_cluster_invocation_gate(
-        merged_cam_trace,
-        road_graph=road_graph,
-        camera_to_node=active_mapping,
-        shortest_paths=shortest_paths,
-        max_speed_mps=float(max_speed_mps),
-        max_span_m=float(max_span_m),
-        min_dwell_sec=float(min_dwell_sec),
-        detour_ratio_threshold=float(detour_ratio_threshold),
-    )
-    if not gate_info["invoke_llm"]:
-        verified = execute_three_tier_corridor_verification(
-            rid_trace,
-            road_graph=road_graph,
+    dp_corridors = None
+    if enable_dp_corridor_separation:
+        dp_corridors = extract_kinematic_dp_corridors(
+            camera_trace,
+            camera_to_node=active_mapping,
             shortest_paths=shortest_paths,
-            max_speed_mps=float(max_speed_mps),
-            max_span_m=float(max_span_m),
-            min_dwell_sec=float(min_dwell_sec),
-            detour_ratio_threshold=float(detour_ratio_threshold),
+            road_graph=road_graph,
+            max_intersection_cam_id=max_intersection_cam_id,
         )
-        return {
-            "trajectory": verified["trajectory"],
-            "invoked_llm": False,
-            "gate_info": gate_info,
-            "retrieval_report": None,
-            "subgraph_stats": None,
-            "routing_decision": None,
-            "verification_audit": verified,
-        }
+    if dp_corridors:
+        merged_cam_trace = list(dp_corridors[0]["camera_trace"])
+        rid_trace = list(dp_corridors[0]["rid_trace"])
+    else:
+        merged_cam_trace = sorted(merge_tm_adj_points(list(camera_trace), adj_range=100), key=lambda x: x[1])
+        rid_trace = [
+            (int(active_mapping[cam]), float(ts))
+            for cam, ts in merged_cam_trace
+            if cam in active_mapping
+        ]
+        rid_trace = sorted(merge_tm_adj_points(rid_trace, adj_range=100), key=lambda x: x[1])
 
-    # Optional C1 Level-2 applicability-gated transition retrieval (G5^kin)
+    # Stage 1 (C1): Evaluate experience bank B(O_q) (if supplied) and invocation gate gamma_inv(O_q)
     retrieval_report = None
     active_experience = retrieved_experience
     active_gate_accepted = bool(gate_accepted) or (active_experience is not None)
@@ -359,6 +269,40 @@ def recover_cluster_trajectory(
                 active_gate_accepted = True
                 active_experience = retrieval_report.get("payload")
 
+    bank_candidate_bindings = _extract_bank_candidate_bindings(active_mapping, active_experience)
+    gate_info = evaluate_cluster_invocation_gate(
+        merged_cam_trace,
+        road_graph=road_graph,
+        camera_to_node=active_mapping,
+        shortest_paths=shortest_paths,
+        max_speed_mps=float(max_speed_mps),
+        max_span_m=float(max_span_m),
+        min_dwell_sec=float(min_dwell_sec),
+        detour_ratio_threshold=float(detour_ratio_threshold),
+        detour_excess_m=float(detour_excess_m),
+        candidate_bindings=bank_candidate_bindings,
+    )
+    if not gate_info["invoke_llm"]:
+        verified = execute_three_tier_corridor_verification(
+            rid_trace,
+            road_graph=road_graph,
+            shortest_paths=shortest_paths,
+            max_speed_mps=float(max_speed_mps),
+            max_span_m=float(max_span_m),
+            min_dwell_sec=float(min_dwell_sec),
+            detour_ratio_threshold=float(detour_ratio_threshold),
+            detour_excess_m=float(detour_excess_m),
+        )
+        return {
+            "trajectory": verified["trajectory"],
+            "invoked_llm": False,
+            "gate_info": gate_info,
+            "retrieval_report": retrieval_report,
+            "subgraph_stats": None,
+            "routing_decision": None,
+            "verification_audit": verified,
+        }
+
     # Stage 2 (C3): Corridor subgraph pruning (G -> G_q) and difficulty-aware routing
     camera_candidates = _build_top2_camera_candidates(
         road_graph, cam_xy_dict, (cam for cam, _ in merged_cam_trace)
@@ -373,14 +317,25 @@ def recover_cluster_trajectory(
         pair_scope="consecutive_and_two_hop",
         k_hop=1,
     )
+    if retrieval_similarity is not None:
+        ret_sim = float(retrieval_similarity)
+    elif active_gate_accepted:
+        audit_dict = (retrieval_report or {}).get("audit") or {}
+        cov = audit_dict.get("complete_current_pair_coverage")
+        ret_sim = float(cov) if isinstance(cov, (int, float)) else 1.0
+    else:
+        ret_sim = 0.0
     case_features = build_case_features_from_trace(
         merged_cam_trace,
         cam_xy_dict=cam_xy_dict,
         rid_trace=rid_trace,
         input_char_length=subgraph_stats["corridor_node_count"] * 64,
         retrieval_count=1 if active_gate_accepted else 0,
+        retrieval_similarity=ret_sim,
         road_graph=road_graph,
         camera_to_node=active_mapping,
+        time_unit="second",
+        coordinate_unit="meter",
     )
     routing_decision = None
     selected_model = None
@@ -392,7 +347,7 @@ def recover_cluster_trajectory(
         )
         selected_model = routing_decision.get("selected_model")
 
-    # Stage 3 (C2): Road-intent generation (if live callable supplied) + three-tier verification on G_q
+    # Stage 3 (C2): Road-intent generation and three-tier verification on G_q
     planned_intents = dict(interval_intents or {})
     if callable(llm_callable):
         llm_output = llm_callable(
@@ -461,6 +416,7 @@ def recover_cluster_trajectory(
         max_span_m=float(max_span_m),
         min_dwell_sec=float(min_dwell_sec),
         detour_ratio_threshold=float(detour_ratio_threshold),
+        detour_excess_m=float(detour_excess_m),
     )
     return {
         "trajectory": verified["trajectory"],
@@ -474,7 +430,7 @@ def recover_cluster_trajectory(
 
 
 def run_pipeline(args) -> Dict[str, Any]:
-    """Execute upstream clustering, C1/C2/C3 trajectory recovery, and multi-metric evaluation."""
+    """Execute trajectory recovery and multi-metric evaluation."""
     dataset = str(getattr(args, "dataset", "uv"))
     records_all = load_car_feat(args.record_file, args.fps, getattr(args, "use_plate", True))
     if dataset in {"uv", "uv_z"}:
@@ -492,6 +448,8 @@ def run_pipeline(args) -> Dict[str, Any]:
         with open(clustering_res_file, "rb") as f:
             labels = pickle.load(f)
     else:
+        from cluster_algorithm import SigCluster
+
         sig_cfg = getattr(args, "sig_cluster", {}) or {}
         feat_dim = int(getattr(args, "feat_dim", 256))
         f_car = [x["car_feature"] for x in records]
@@ -512,7 +470,7 @@ def run_pipeline(args) -> Dict[str, Any]:
         )
 
     clustering_metrics = evaluate(records, labels, log=True)
-    road_graph, camera_to_node, cam_xy_dict, shortest_paths, traj_gt_dict, _ = load_road_assets(args)
+    road_graph, camera_to_node, cam_xy_dict, shortest_paths, traj_gt_dict = load_road_assets(args)
     processed_paths = preprocess_paths_with_length(shortest_paths, road_graph)
     vid2cid = gen_vid2cid(records, labels)
 
@@ -552,6 +510,10 @@ def run_pipeline(args) -> Dict[str, Any]:
     max_span = float(getattr(args, "max_span_m", 1200.0))
     min_dwell = float(getattr(args, "min_dwell_sec", 30.0))
     detour_ratio = float(getattr(args, "detour_ratio_threshold", 1.05))
+    detour_excess = float(getattr(args, "detour_excess_m", 0.0))
+    enable_dp_sep = bool(getattr(args, "enable_dp_corridor_separation", False))
+    max_inter_cam = getattr(args, "max_intersection_cam_id", None)
+    max_inter_cam = None if max_inter_cam is None else int(max_inter_cam)
 
     for cid, raw_trace in sorted(cluster_cam_traces.items()):
         outcome = recover_cluster_trajectory(
@@ -568,6 +530,9 @@ def run_pipeline(args) -> Dict[str, Any]:
             max_span_m=max_span,
             min_dwell_sec=min_dwell,
             detour_ratio_threshold=detour_ratio,
+            detour_excess_m=detour_excess,
+            enable_dp_corridor_separation=enable_dp_sep,
+            max_intersection_cam_id=max_inter_cam,
         )
         recovered_traj_dict[cid] = outcome["trajectory"]
 
@@ -592,7 +557,7 @@ def run_pipeline(args) -> Dict[str, Any]:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Trajectory Recovery Pipeline (C1 + C2 + C3)")
+    parser = argparse.ArgumentParser(description="Road-Network Trajectory Recovery Pipeline")
     parser.add_argument("--cfg_file", type=str, default="config/uv.yaml", help="Path to YAML configuration file")
     parser.add_argument("--allow-api", dest="allow_api", action="store_true", help="Enable live LLM API requests")
     known_args, _ = parser.parse_known_args()
