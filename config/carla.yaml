@@ -15,6 +15,7 @@ cid_rid_correspondence_file: "./cache_data/carla/cid_rid_correspondence.pkl"
 rid_shortest_path_results_file: "./cache_data/carla/rid_shortest_path_result.pkl"
 cam_xy_dict_file: "./cache_data/carla/cam_xy_dict.pkl"
 road_node_traj_gt_file: "./cache_data/carla/traj_gt.pkl"
+experience_bank_file: ""
 
 # Upstream clustering
 sig_cluster:
