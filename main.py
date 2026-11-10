@@ -122,6 +122,22 @@ def _build_public_mapping_context(camera_trace, *, road_graph, camera_to_node, c
     return build_camera_mapping_context(ctx, road_graph=road_graph)
 
 
+def _extract_experience_extra_nodes(active_experience):
+    """Collect retrieved candidate/teacher road nodes W_q for corridor subgraph construction."""
+    if not isinstance(active_experience, dict):
+        return None
+    nodes = set()
+    for row in (active_experience.get("teacher") or {}).get("mapping") or []:
+        if isinstance(row, (list, tuple)) and len(row) >= 2:
+            nodes.add(int(row[1]))
+    for row in active_experience.get("camera_support") or []:
+        if isinstance(row, (list, tuple)) and len(row) >= 3:
+            for item in row[2] or []:
+                if isinstance(item, (list, tuple)) and len(item) >= 3 and (int(item[1]) + int(item[2])) > 0:
+                    nodes.add(int(item[0]))
+    return sorted(nodes) or None
+
+
 def _make_llm_road_intent_callable(camera_to_node, cam_xy_dict):
     """Build a live C2 road-intent callable backed by LLMClient on corridor subgraph G_q."""
     def _call(*, camera_trace, corridor_subgraph, model, retrieved_experience=None, **_kwargs):
@@ -139,37 +155,44 @@ def _make_llm_road_intent_callable(camera_to_node, cam_xy_dict):
             road_graph=corridor_subgraph,
             retrieved_experience=retrieved_experience,
         )
-        raw_text = LLMClient.call_llm(prompt, model=model)
         try:
+            raw_text = LLMClient.call_llm(prompt, model=model)
             groups, _, mapping = parse_camera_mapping_response(raw_text, ctx, road_graph=corridor_subgraph)
         except Exception:
-            return {"camera_node_choices": {}, "interval_intents": {}}
+            return {"camera_node_choices": {}, "interval_intents": {}, "fallback_on_error": True}
         obs_id_to_idx = {
             obs["obs_id"]: int(obs["input_index"])
             for obs in ctx.get("observations", [])
             if "obs_id" in obs and "input_index" in obs
         }
-        intents = {}
-        intents_by_obs_pair = {}
-        retained_indices = None
-        tracks = groups.get("tracks") or []
-        if tracks:
-            retained_indices = [
+        parsed_tracks = []
+        for trk in groups.get("tracks") or []:
+            t_indices = [
                 obs_id_to_idx[oid]
-                for oid in (tracks[0].get("obs_ids") or [])
+                for oid in (trk.get("obs_ids") or [])
                 if oid in obs_id_to_idx
             ]
-            for seg_idx, item in enumerate(tracks[0].get("interval_intents") or []):
+            t_intents = {}
+            t_pair_intents = {}
+            for seg_idx, item in enumerate(trk.get("interval_intents") or []):
                 via_list = [int(n) for n in (item.get("via_nodes") or [])]
-                intents[seg_idx] = via_list
+                t_intents[seg_idx] = via_list
                 f_oid, t_oid = item.get("from_obs_id"), item.get("to_obs_id")
                 if f_oid in obs_id_to_idx and t_oid in obs_id_to_idx:
-                    intents_by_obs_pair[(obs_id_to_idx[f_oid], obs_id_to_idx[t_oid])] = via_list
+                    t_pair_intents[(obs_id_to_idx[f_oid], obs_id_to_idx[t_oid])] = via_list
+            if t_indices:
+                parsed_tracks.append({
+                    "retained_obs_indices": t_indices,
+                    "interval_intents": t_intents,
+                    "interval_intents_by_obs_pair": t_pair_intents,
+                })
+        primary = parsed_tracks[0] if parsed_tracks else {}
         return {
             "camera_node_choices": mapping,
-            "interval_intents": intents,
-            "interval_intents_by_obs_pair": intents_by_obs_pair,
-            "retained_obs_indices": retained_indices,
+            "interval_intents": primary.get("interval_intents", {}),
+            "interval_intents_by_obs_pair": primary.get("interval_intents_by_obs_pair", {}),
+            "retained_obs_indices": primary.get("retained_obs_indices"),
+            "parsed_tracks": parsed_tracks,
         }
 
     return _call
@@ -205,6 +228,7 @@ def recover_cluster_trajectory(
     router: PerformanceAwareMultiLLMRouter | None = None,
     llm_callable=None,
     experience_bank: Dict[str, Any] | None = None,
+    query_source_group: str | None = None,
     retrieved_experience: Any | None = None,
     retrieval_similarity: float | None = None,
     gate_accepted: bool = False,
@@ -220,6 +244,7 @@ def recover_cluster_trajectory(
 ) -> Dict[str, Any]:
     """Execute the closed-loop C1 -> C3 -> C2 trajectory recovery pipeline (Algorithm 1)."""
     active_mapping = dict(camera_to_node or {})
+    dwell_adj = max(0.0, min(float(min_dwell_sec), 30.0))
     dp_corridors = None
     if enable_dp_corridor_separation:
         dp_corridors = extract_kinematic_dp_corridors(
@@ -233,13 +258,13 @@ def recover_cluster_trajectory(
         merged_cam_trace = list(dp_corridors[0]["camera_trace"])
         rid_trace = list(dp_corridors[0]["rid_trace"])
     else:
-        merged_cam_trace = sorted(merge_tm_adj_points(list(camera_trace), adj_range=100), key=lambda x: x[1])
+        merged_cam_trace = sorted(merge_tm_adj_points(list(camera_trace), adj_range=dwell_adj), key=lambda x: x[1])
         rid_trace = [
             (int(active_mapping[cam]), float(ts))
             for cam, ts in merged_cam_trace
             if cam in active_mapping
         ]
-        rid_trace = sorted(merge_tm_adj_points(rid_trace, adj_range=100), key=lambda x: x[1])
+        rid_trace = sorted(merge_tm_adj_points(rid_trace, adj_range=dwell_adj), key=lambda x: x[1])
 
     # Stage 1 (C1): Evaluate experience bank B(O_q) (if supplied) and invocation gate gamma_inv(O_q)
     retrieval_report = None
@@ -264,6 +289,7 @@ def recover_cluster_trajectory(
                 road_graph=road_graph,
                 teacher_kinematics_index=experience_bank.get("teacher_kinematics_index", {}),
                 v_stop_mps=float(experience_bank.get("v_stop_mps", 5.0)),
+                exclude_source_group=query_source_group,
             )
             if retrieval_report.get("gate", {}).get("inject") is True:
                 active_gate_accepted = True
@@ -293,8 +319,23 @@ def recover_cluster_trajectory(
             detour_ratio_threshold=float(detour_ratio_threshold),
             detour_excess_m=float(detour_excess_m),
         )
+        secondary_tracks = []
+        for sub_c in (dp_corridors or [])[1:]:
+            sub_v = execute_three_tier_corridor_verification(
+                list(sub_c["rid_trace"]),
+                road_graph=road_graph,
+                shortest_paths=shortest_paths,
+                max_speed_mps=float(max_speed_mps),
+                max_span_m=float(max_span_m),
+                min_dwell_sec=float(min_dwell_sec),
+                detour_ratio_threshold=float(detour_ratio_threshold),
+                detour_excess_m=float(detour_excess_m),
+            )
+            if sub_v["trajectory"]:
+                secondary_tracks.append(sub_v["trajectory"])
         return {
             "trajectory": verified["trajectory"],
+            "tracks": [verified["trajectory"], *secondary_tracks] if verified["trajectory"] else secondary_tracks,
             "invoked_llm": False,
             "gate_info": gate_info,
             "retrieval_report": retrieval_report,
@@ -307,6 +348,7 @@ def recover_cluster_trajectory(
     camera_candidates = _build_top2_camera_candidates(
         road_graph, cam_xy_dict, (cam for cam, _ in merged_cam_trace)
     )
+    extra_nodes = _extract_experience_extra_nodes(active_experience)
     corridor_subgraph, subgraph_stats = build_cluster_corridor_subgraph(
         merged_cam_trace,
         road_graph=road_graph,
@@ -316,20 +358,45 @@ def recover_cluster_trajectory(
         sp_cache=sp_cache if sp_cache is not None else {},
         pair_scope="consecutive_and_two_hop",
         k_hop=1,
+        extra_nodes=extra_nodes,
     )
     if retrieval_similarity is not None:
         ret_sim = float(retrieval_similarity)
     elif active_gate_accepted:
         audit_dict = (retrieval_report or {}).get("audit") or {}
         cov = audit_dict.get("complete_current_pair_coverage")
-        ret_sim = float(cov) if isinstance(cov, (int, float)) else 1.0
+        denom = max(1, len(merged_cam_trace) - 1)
+        if isinstance(cov, (int, float)):
+            ret_sim = float(cov) / denom if float(cov) > 1.0 else float(cov)
+        else:
+            ret_sim = 1.0
     else:
         ret_sim = 0.0
+    prompt_char_len = int(3200 + 310 * subgraph_stats["corridor_node_count"] + (2200 if active_gate_accepted else 0))
+    if isinstance(cam_xy_dict, dict) and corridor_subgraph.number_of_nodes() >= 2:
+        try:
+            prompt_ctx = _build_public_mapping_context(
+                merged_cam_trace,
+                road_graph=corridor_subgraph,
+                camera_to_node=active_mapping,
+                cam_xy_dict=cam_xy_dict,
+            )
+            if prompt_ctx is not None:
+                prompt_char_len = len(
+                    build_camera_mapping_prompt(
+                        prompt_ctx,
+                        include_pair_evidence=True,
+                        road_graph=corridor_subgraph,
+                        retrieved_experience=active_experience,
+                    )
+                )
+        except Exception:
+            pass
     case_features = build_case_features_from_trace(
         merged_cam_trace,
         cam_xy_dict=cam_xy_dict,
         rid_trace=rid_trace,
-        input_char_length=subgraph_stats["corridor_node_count"] * 64,
+        input_char_length=prompt_char_len,
         retrieval_count=1 if active_gate_accepted else 0,
         retrieval_similarity=ret_sim,
         road_graph=road_graph,
@@ -402,7 +469,7 @@ def recover_cluster_trajectory(
                         for cam, ts in merged_cam_trace
                         if cam in active_mapping
                     ]
-                    rid_trace = sorted(merge_tm_adj_points(rid_trace, adj_range=100), key=lambda x: x[1])
+                    rid_trace = sorted(merge_tm_adj_points(rid_trace, adj_range=dwell_adj), key=lambda x: x[1])
                 if isinstance(llm_output.get("interval_intents"), dict):
                     planned_intents = {int(k): list(v) for k, v in llm_output["interval_intents"].items()}
 
@@ -418,9 +485,24 @@ def recover_cluster_trajectory(
         detour_ratio_threshold=float(detour_ratio_threshold),
         detour_excess_m=float(detour_excess_m),
     )
+    verified_tracks = list(verified.get("tracks") or ([verified["trajectory"]] if verified["trajectory"] else []))
+    for sub_c in (dp_corridors or [])[1:]:
+        sub_v = execute_three_tier_corridor_verification(
+            list(sub_c["rid_trace"]),
+            road_graph=exec_graph,
+            shortest_paths=shortest_paths,
+            max_speed_mps=float(max_speed_mps),
+            max_span_m=float(max_span_m),
+            min_dwell_sec=float(min_dwell_sec),
+            detour_ratio_threshold=float(detour_ratio_threshold),
+            detour_excess_m=float(detour_excess_m),
+        )
+        if sub_v["trajectory"]:
+            verified_tracks.append(sub_v["trajectory"])
     return {
         "trajectory": verified["trajectory"],
-        "invoked_llm": True,
+        "tracks": verified_tracks,
+        "invoked_llm": bool(callable(llm_callable)),
         "gate_info": gate_info,
         "retrieval_report": retrieval_report,
         "subgraph_stats": subgraph_stats,

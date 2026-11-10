@@ -376,13 +376,11 @@ def build_cluster_track_prompt(context, mode):
         "events, use evaluation answers, or change source timestamps. This is the task's cluster-membership "
         "assumption, not a physical guarantee. An unsupported connection stays unknown within this same "
         "track; retain both endpoint observations. Camera locations and road-node coordinates have "
-        "different meanings. The 65 m/s "
-        "number is a diagnostic assumption, not a certified physical bound. " if single_cluster else
+        "different meanings. " if single_cluster else
         "Recover all distinguishable trajectory hypotheses in this supplied cluster. "
         "The cluster may contain several trajectories. No event has a certified identity; "
         "do not invent vehicle identities, change times, or force every event into one trajectory. "
-        "Camera locations and road-node coordinates have different meanings. The 65 m/s number "
-        "is an engineering diagnostic assumption, not a physical guarantee or identity decision. "
+        "Camera locations and road-node coordinates have different meanings. "
         "Use singleton tracks or unassigned_obs_ids when a connection is unsupported. "
         "A singleton is an unverified one-event hypothesis, not an identified vehicle. ")
     if single_cluster:

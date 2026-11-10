@@ -219,7 +219,7 @@ def build_camera_mapping_prompt(
     if prompt.count(old_root) != 2:
         raise ValueError("Frozen road-intent output contract changed; review mapping wrapper")
     prompt = prompt.replace(old_root, new_root)
-    prompt = ("This is the separate camera_mapping_v1 experiment. Select exactly one integer road_node from "
+    prompt = ("Select exactly one integer road_node from "
             "each camera's supplied camera_mapping_candidates. camera_node_choices must cover every supplied "
             "camera exactly once, including cameras of events listed in unassigned_obs_ids. Use one mapping "
             "consistently for repeated observations of that camera and neighboring intervals. Existing "
@@ -368,11 +368,10 @@ def build_cluster_corridor_subgraph(
                 pre = sp_precomputed[src].get(dst)
             if isinstance(pre, (list, tuple)) and len(pre) >= 1 and isinstance(pre[0], (list, tuple)):
                 sp_cache[(src, dst)] = tuple(pre[0])
-            elif isinstance(pre, (list, tuple)):
+                return sp_cache[(src, dst)]
+            if isinstance(pre, (list, tuple)) and pre:
                 sp_cache[(src, dst)] = tuple(pre)
-            else:
-                sp_cache[(src, dst)] = ()
-            return sp_cache[(src, dst)]
+                return sp_cache[(src, dst)]
         nonlocal norm_graph
         if norm_graph is None:
             norm_graph = sp_cache.setdefault(
@@ -651,6 +650,8 @@ def execute_three_tier_corridor_verification(
     min_dwell_sec=30.0,
     detour_ratio_threshold=1.05,
     detour_excess_m=0.0,
+    max_expansions=200000,
+    dijkstra_timeout_sec=2.0,
 ):
     """Execute C2 three-tier deterministic corridor verification and timestamp interpolation (Section III-B2, Eq. 5).
 
@@ -664,16 +665,21 @@ def execute_three_tier_corridor_verification(
         min_dwell_sec: Dwell collapse threshold Delta t_dwell (default 30.0 s).
         detour_ratio_threshold: Optional three-point detour ratio threshold eta_detour (default 1.05).
         detour_excess_m: Minimum excess path length Delta_detour in metres required to trigger a detour spike (default 0.0 m).
+        max_expansions: Bounded Dijkstra node expansion cap (default 200,000).
+        dijkstra_timeout_sec: Bounded Dijkstra per-query wall-clock limit in seconds (default 2.0 s).
     """
-    import networkx as nx
+    import heapq
+    import time
 
     if not observations:
-        return {"trajectory": [], "segment_audits": [], "tier_counts": {1: 0, 2: 0, 3: 0}, "unresolved_count": 0}
+        return {"trajectory": [], "tracks": [], "segment_audits": [], "tier_counts": {1: 0, 2: 0, 3: 0}, "unresolved_count": 0}
     intents = interval_intents or {}
     sp_dict = shortest_paths if isinstance(shortest_paths, dict) else {}
     span_cap = None if max_span_m is None else float(max_span_m)
     detour_cap = None if detour_ratio_threshold is None else float(detour_ratio_threshold)
     excess_cap = max(0.0, float(detour_excess_m or 0.0))
+    expansion_cap = max(1, int(max_expansions))
+    timeout_cap = max(0.01, float(dijkstra_timeout_sec))
 
     def _span_ok(dist_m):
         return span_cap is None or float(dist_m) <= span_cap
@@ -686,23 +692,61 @@ def execute_three_tier_corridor_verification(
         lengths = [float(d["length"]) for d in edges if isinstance(d, dict) and "length" in d and float(d["length"]) > 0]
         return min(lengths) if lengths else None
 
+    def _bounded_dijkstra(src, dst):
+        if not road_graph.has_node(src) or not road_graph.has_node(dst):
+            return None
+        t0 = time.perf_counter()
+        dist = {src: 0.0}
+        prev = {}
+        heap = [(0.0, 0, str(src), src)]
+        serial = 0
+        expansions = 0
+        settled = set()
+        while heap:
+            d_u, _, _, u = heapq.heappop(heap)
+            if u in settled:
+                continue
+            settled.add(u)
+            if u == dst:
+                nodes = [dst]
+                cur = dst
+                while cur in prev:
+                    cur = prev[cur]
+                    nodes.append(cur)
+                nodes.reverse()
+                cum = [0.0]
+                for a, b in zip(nodes, nodes[1:]):
+                    w = _edge_len(a, b)
+                    if w is None:
+                        return None
+                    cum.append(cum[-1] + w)
+                return nodes, cum, cum[-1]
+            expansions += 1
+            if expansions > expansion_cap or (expansions & 255 == 0 and (time.perf_counter() - t0) > timeout_cap):
+                return None
+            for nbr in sorted(road_graph.neighbors(u), key=str):
+                if nbr in settled:
+                    continue
+                w = _edge_len(u, nbr)
+                if w is None:
+                    continue
+                nd = d_u + w
+                if nd < dist.get(nbr, float("inf")):
+                    dist[nbr] = nd
+                    prev[nbr] = u
+                    serial += 1
+                    heapq.heappush(heap, (nd, serial, str(nbr), nbr))
+        return None
+
     def _shortest_path(u, v):
         if u == v:
             return [u], [0.0], 0.0
         cached = sp_dict.get((u, v))
         if isinstance(cached, (list, tuple)) and len(cached) == 3 and cached[0]:
-            return list(cached[0]), list(cached[1]), float(cached[2])
-        try:
-            nodes = nx.shortest_path(road_graph, u, v, weight="length")
-        except (nx.NetworkXNoPath, nx.NodeNotFound):
-            return None
-        cum = [0.0]
-        for a, b in zip(nodes, nodes[1:]):
-            w = _edge_len(a, b)
-            if w is None:
-                return None
-            cum.append(cum[-1] + w)
-        return nodes, cum, cum[-1]
+            nodes = list(cached[0])
+            if all(_edge_len(a, b) is not None for a, b in zip(nodes, nodes[1:])):
+                return nodes, list(cached[1]), float(cached[2])
+        return _bounded_dijkstra(u, v)
 
     def _interpolate(nodes, cum_lengths, t_start, t_end):
         total = cum_lengths[-1]
@@ -728,9 +772,16 @@ def execute_three_tier_corridor_verification(
         cleaned.append((int(node), ts))
 
     if len(cleaned) == 1:
-        return {"trajectory": list(cleaned), "segment_audits": [], "tier_counts": {1: 0, 2: 0, 3: 0}, "unresolved_count": 0}
+        return {
+            "trajectory": list(cleaned),
+            "tracks": [list(cleaned)],
+            "segment_audits": [],
+            "tier_counts": {1: 0, 2: 0, 3: 0},
+            "unresolved_count": 0,
+        }
 
-    trajectory = [cleaned[0]]
+    tracks = []
+    current_track = [cleaned[0]]
     audits = []
     tier_counts = {1: 0, 2: 0, 3: 0}
     unresolved = 0
@@ -810,7 +861,11 @@ def execute_three_tier_corridor_verification(
         if accepted is not None:
             nodes, cum, ts0, ts1, hop_step = accepted
             pts = _interpolate(nodes, cum, ts0, ts1)
-            trajectory.extend(pts[1:])
+            if not current_track or current_track[-1][0] != pts[0][0]:
+                if current_track:
+                    tracks.append(current_track)
+                current_track = [pts[0]]
+            current_track.extend(pts[1:])
             tier_counts[selected_tier] += 1
             audits.append({
                 "segment_index": idx,
@@ -824,20 +879,39 @@ def execute_three_tier_corridor_verification(
             idx += hop_step
         else:
             unresolved += 1
-            trajectory.append((v, t_end))
+            if idx == 0 and len(current_track) <= 1:
+                # Trim leading boundary spike at i = 1 (1-indexed) and restart from next anchor
+                action = "trimmed_start_boundary_spike"
+                current_track = [(v, t_end)]
+            elif idx == len(cleaned) - 2:
+                # Trim terminal boundary spike at i = m without appending a disconnected jump
+                action = "trimmed_end_boundary_spike"
+            else:
+                # Split span exceeding d_max / unresolved interior gap into a clean connected sub-track
+                action = "split_connected_subtrack"
+                if current_track:
+                    tracks.append(current_track)
+                current_track = [(v, t_end)]
             audits.append({
                 "segment_index": idx,
                 "from_node": u,
                 "to_node": v,
                 "tier": None,
-                "route_nodes": [u, v],
+                "action": action,
+                "route_nodes": [],
                 "path_length_m": None,
                 "bypassed_observation_index": None,
             })
             idx += 1
 
+    if current_track:
+        tracks.append(current_track)
+    multi_node_tracks = [t for t in tracks if len(t) >= 2]
+    primary_trajectory = max(multi_node_tracks or tracks, key=len) if tracks else []
+
     return {
-        "trajectory": trajectory,
+        "trajectory": primary_trajectory,
+        "tracks": tracks,
         "segment_audits": audits,
         "tier_counts": tier_counts,
         "unresolved_count": unresolved,

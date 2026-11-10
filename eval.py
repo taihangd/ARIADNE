@@ -138,8 +138,9 @@ def eval_traj(
     recall = recall / gt_total if gt_total else 0.0
     fscore = 2 * precision * recall / (precision + recall + 1e-8)
     print("------------------")
+    valid_traj_count = sum(1 for k in pred_traj_dict if int(k) >= 0)
     print(
-        f"trajectories: {len(pred_traj_dict)-1}\nprecision: {precision}\nrecall:    {recall}\nfscore:    {fscore}"
+        f"trajectories: {valid_traj_count}\nprecision: {precision}\nrecall:    {recall}\nfscore:    {fscore}"
     )
     print("------------------")
     return precision, recall, fscore, vid_to_traj_id

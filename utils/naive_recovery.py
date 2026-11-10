@@ -128,7 +128,7 @@ def recover_rule_shortest_path(query, *, road_graph, camera_to_node, shortest_pa
         raise ValueError("rule_shortest_path requires graph, camera mapping and preprocessed paths")
     observed = map_recovery_observations(query, camera_to_node=camera_to_node, road_graph=road_graph)
 
-    from main import complete_trajectories_fast
+    from common import complete_trajectories_fast
     trajectory = observed[:1]
     segments = []
     for index, (start, end) in enumerate(zip(observed, observed[1:])):

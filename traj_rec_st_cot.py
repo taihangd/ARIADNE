@@ -25,14 +25,16 @@ class LLMClient:
     API_KEY: Optional[str] = None
     API_URL: Optional[str] = None
     PROVIDERS: Dict[str, Dict[str, Optional[str]]] = {}
-    DEFAULT_MODEL: str = "qwen3.5-plus"
+    DEFAULT_MODEL: str = "gpt-4.1-nano"
     DEFAULT_TEMPERATURE: float = 0.0
+    DEFAULT_SEED: Optional[int] = 0
     DEFAULT_MAX_TOKENS: int = 8192
     MAX_TOKENS_CAP: int = 8192
     MAX_RETRIES: int = 1
     LENGTH_RETRY_LIMIT: int = 0
     REQUEST_TIMEOUT: int = 180
     DEFAULT_REQUEST_OPTIONS: Dict = {}
+    MODEL_REQUEST_OPTIONS: Dict[str, Dict] = {}
     DEFAULT_RESPONSE_MODEL_NAMES: list = []
 
     @staticmethod
@@ -72,14 +74,22 @@ class LLMClient:
         if cls.API_KEY is None and not parsed_providers:
             cls.API_KEY = resolve_api_key(cfg)
         cls.API_URL = cls._normalize_endpoint_url(cfg.get("api_url", cls.API_URL or "https://api.openai.com/v1"))
-        cls.DEFAULT_MODEL = str(cfg.get("default_model", "qwen3.5-plus"))
+        cls.DEFAULT_MODEL = str(cfg.get("default_model", "gpt-4.1-nano"))
         cls.DEFAULT_TEMPERATURE = float(cfg.get("default_temperature", 0.0))
+        raw_seed = cfg.get("default_seed", 0)
+        cls.DEFAULT_SEED = None if raw_seed is None else int(raw_seed)
         cls.DEFAULT_MAX_TOKENS = int(cfg.get("default_max_tokens", 8192))
         cls.MAX_TOKENS_CAP = int(cfg.get("max_tokens_cap", 8192))
         cls.MAX_RETRIES = int(cfg.get("max_retries", 1))
         cls.LENGTH_RETRY_LIMIT = int(cfg.get("length_retry_limit", 0))
         cls.REQUEST_TIMEOUT = int(cfg.get("request_timeout", 180))
         cls.DEFAULT_REQUEST_OPTIONS = request_options
+        model_opts = cfg.get("model_request_options") if isinstance(cfg.get("model_request_options"), dict) else {}
+        cls.MODEL_REQUEST_OPTIONS = {
+            str(k).lower(): normalize_request_options(v)
+            for k, v in model_opts.items()
+            if isinstance(v, dict)
+        }
         cls.DEFAULT_RESPONSE_MODEL_NAMES = response_model_names
 
     @classmethod
@@ -127,13 +137,22 @@ class LLMClient:
         call_started = time.perf_counter()
         started_at_utc = datetime.now(timezone.utc).isoformat()
         call_id = uuid4().hex
-        request_options = normalize_request_options(
-            cls.DEFAULT_REQUEST_OPTIONS if request_options is None else request_options)
+        model = cls.DEFAULT_MODEL if model is None else str(model)
+        lower_model = model.lower()
+        merged_req_opts = dict(cls.DEFAULT_REQUEST_OPTIONS)
+        if lower_model.startswith("qwen"):
+            merged_req_opts.setdefault("enable_thinking", False)
+            merged_req_opts.setdefault("max_tokens_parameter", "max_completion_tokens")
+        for prefix, m_opts in cls.MODEL_REQUEST_OPTIONS.items():
+            if lower_model == prefix or lower_model.startswith(prefix + "-"):
+                merged_req_opts.update(m_opts)
+        if request_options is not None:
+            merged_req_opts.update(normalize_request_options(request_options))
+        request_options = normalize_request_options(merged_req_opts)
         response_model_names = normalize_response_model_names(
             cls.DEFAULT_RESPONSE_MODEL_NAMES if response_model_names is None else response_model_names)
         request_contract = {"request_options": dict(request_options),
                             "response_model_names": list(response_model_names)}
-        model = cls.DEFAULT_MODEL if model is None else str(model)
         api_url, api_key = cls._resolve_provider_credentials(model, api_url, api_key)
         if api_key is None or api_url is None:
             raise RuntimeError(
@@ -141,6 +160,7 @@ class LLMClient:
                 "or provide api_key/api_url under the llm_client section in the YAML config"
             )
         temperature = cls.DEFAULT_TEMPERATURE if temperature is None else float(temperature)
+        seed = cls.DEFAULT_SEED if seed is None else int(seed)
         max_retries = cls.MAX_RETRIES if max_retries is None else int(max_retries)
         max_tokens = cls.DEFAULT_MAX_TOKENS if max_tokens is None else int(max_tokens)
         max_tokens_cap = cls.MAX_TOKENS_CAP if max_tokens_cap is None else int(max_tokens_cap)
@@ -225,7 +245,7 @@ class LLMClient:
 
         while failed_attempts < max_attempts:
             if deadline is not None and time.perf_counter() >= deadline:
-                error = TimeoutError("Experiment runtime deadline reached")
+                error = TimeoutError("LLM request deadline exceeded")
                 error.status = "timeout"
                 error.metadata = {**accounting(), "error_category": "TimeoutError"}
                 raise error
@@ -245,7 +265,7 @@ class LLMClient:
             # Budget reservation itself may take time; do not record an unsent request as an attempt if expired.
             remaining = None if deadline is None else deadline - time.perf_counter()
             if remaining is not None and remaining <= 0:
-                error = TimeoutError("Experiment runtime deadline reached")
+                error = TimeoutError("LLM request deadline exceeded")
                 error.status = "timeout"
                 error.metadata = {**accounting(), "error_category": "TimeoutError"}
                 raise error

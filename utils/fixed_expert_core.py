@@ -547,17 +547,75 @@ def evaluate_g5_kinematic_boundary_gate(context, g5_gate_audit, *, road_graph,
     return audit
 
 
+def _filter_payload_by_passing_bindings(payload, bindings):
+    """Prune non-passing trigger bindings elementwise while preserving typed support table invariants."""
+    if not isinstance(payload, dict) or not bindings:
+        return payload
+    passing_pairs = {
+        (int(b["camera_id"]), int(b["conditional_supported_node"]))
+        for b in bindings
+        if b.get("passes") and "camera_id" in b and "conditional_supported_node" in b
+    }
+    rejected_pairs = {
+        (int(b["camera_id"]), int(b["conditional_supported_node"]))
+        for b in bindings
+        if not b.get("passes") and "camera_id" in b and "conditional_supported_node" in b
+    } - passing_pairs
+    if not rejected_pairs:
+        return payload
+    filtered = copy.deepcopy(payload)
+    node_pair_counts = {}
+    new_pair_support = []
+    for row in filtered.get("pair_support", []):
+        obs_pairs, cam_pair, combos, _, src_conflict = row
+        a, b = int(cam_pair[0]), int(cam_pair[1])
+        kept = [
+            list(item)
+            for item in combos
+            if (a, int(item[0])) not in rejected_pairs and (b, int(item[1])) not in rejected_pairs
+        ]
+        for left, right, cnt in kept:
+            if cnt:
+                node_pair_counts.setdefault((a, int(left)), []).append(int(cnt))
+                node_pair_counts.setdefault((b, int(right)), []).append(int(cnt))
+        new_pair_support.append([obs_pairs, cam_pair, kept, len(kept) > 1, bool(src_conflict and len(kept) > 1)])
+    filtered["pair_support"] = new_pair_support
+
+    new_cam_support = []
+    for row in filtered.get("camera_support", []):
+        cam, obs_ids, supports, _, src_conflict = row
+        cam_id = int(cam)
+        new_supports = []
+        for node, same_dir, cam_only, _ in supports:
+            node_id = int(node)
+            if (cam_id, node_id) in rejected_pairs:
+                new_supports.append([node_id, 0, 0, "unknown"])
+            else:
+                counts = node_pair_counts.get((cam_id, node_id), [])
+                lo, hi = max(counts, default=0), sum(counts)
+                adj_same_dir = min(max(int(same_dir), lo), hi) if counts else 0
+                adj_cam_only = int(cam_only)
+                status = "conditional_train_annotation" if (adj_same_dir + adj_cam_only) > 0 else "unknown"
+                new_supports.append([node_id, adj_same_dir, adj_cam_only, status])
+        active_nodes = sum(1 for item in new_supports if (item[1] + item[2]) > 0)
+        new_cam_support.append([cam, obs_ids, new_supports, active_nodes > 1, bool(src_conflict and active_nodes > 1)])
+    filtered["camera_support"] = new_cam_support
+
+    teacher = filtered.get("teacher")
+    if isinstance(teacher, dict) and isinstance(teacher.get("mapping"), list):
+        teacher["mapping"] = [
+            list(item)
+            for item in teacher["mapping"]
+            if (int(item[0]), int(item[1])) not in rejected_pairs
+        ]
+    return filtered
+
+
 def retrieve_mapping_experience_with_local_fallback(context, strict_index, local_index, *,
         source_eligible_ids, candidate_rows, selection="structural", seed=0, max_characters=4000,
-        local_gate="g5_kinematic_boundary_v1", road_graph=None, teacher_kinematics_index=None, v_stop_mps=5.0):
-    """Preserve a strict trigger; try local soft support only after abstention.
-
-    ``fallback_used`` records entry into the local branch. The returned gate's
-    ``inject`` flag determines whether its unchanged payload may be injected.
-    Both branches use the same caller-audited candidates and original gate.
-    Optional g5_any is a post-hoc development candidate for this local mapping
-    branch only. It preserves either the complete local prompt or strict result.
-    """
+        local_gate="g5_kinematic_boundary_v1", road_graph=None, teacher_kinematics_index=None,
+        v_stop_mps=5.0, exclude_source_group=None):
+    """Retrieve whole-chain directional matches first and apply elementwise G5/G5^kin filtering on local fallback."""
     if local_gate not in (None, "g5_any", "g5_any_time_boundary_v1", "g5_kinematic_boundary_v1"):
         raise ValueError("Local mapping gate must be None or g5_any or g5_any_time_boundary_v1 or g5_kinematic_boundary_v1")
     if (not isinstance(strict_index, dict) or not isinstance(local_index, dict)
@@ -569,6 +627,25 @@ def retrieve_mapping_experience_with_local_fallback(context, strict_index, local
                    for cid, record in strict_index["cases"].items())):
         raise ValueError("Local fallback index must preserve every strict mapping record")
     source_eligible_ids, candidate_rows = list(source_eligible_ids), list(candidate_rows)
+    if exclude_source_group is not None and str(exclude_source_group).strip():
+        excl = str(exclude_source_group).strip()
+        disallowed_cids = {
+            cid for cid, rec in local_index["cases"].items()
+            if isinstance(rec, dict) and str(
+                rec.get("source_group_id") or rec.get("source_group") or rec.get("group_id") or rec.get("source_id") or ""
+            ) == excl
+        }
+        for row in candidate_rows:
+            if isinstance(row, dict) and str(
+                row.get("source_group_id") or row.get("source_group") or row.get("group_id") or row.get("source_id") or ""
+            ) == excl:
+                if "case_id" in row:
+                    disallowed_cids.add(row["case_id"])
+        source_eligible_ids = [cid for cid in source_eligible_ids if cid not in disallowed_cids]
+        candidate_rows = [
+            row for row in candidate_rows
+            if not (isinstance(row, dict) and row.get("case_id") in disallowed_cids)
+        ]
     options = {"source_eligible_ids": source_eligible_ids, "candidate_rows": candidate_rows,
                "selection": selection, "seed": seed, "max_characters": max_characters}
     strict = retrieve_mapping_experience(context, strict_index, **options)
@@ -583,11 +660,11 @@ def retrieve_mapping_experience_with_local_fallback(context, strict_index, local
     if local_gate is None:
         return local_result
     time_boundary_policy = local_gate in ("g5_any_time_boundary_v1", "g5_kinematic_boundary_v1")
-    audit = {"schema": "g5_any_local_gate_v1", "policy": local_gate,
-             "formula": "any((not b.touches_boundary) or b.known_source_count >= 2 for b in trigger_bindings)",
+    audit = {"schema": "g5_elementwise_local_gate_v1", "policy": local_gate,
+             "formula": "elementwise filter {b : (not b.touches_boundary) or b.known_source_count >= 2}",
              "boundary_definition": ("validated_context_time_order_first_last" if time_boundary_policy
                                      else "numeric_obs_id_suffix_min_max_from_complete_camera_support"),
-             "posthoc_development_candidate": True, "query_answers_used": False,
+             "query_answers_used": False,
              "new_API_requests": 0, "graph_searches": 0, "bindings": [], "allow": False}
     if not local_result["gate"]["inject"]:
         audit["reason"] = "original_local_gate_abstained"
@@ -619,7 +696,7 @@ def retrieve_mapping_experience_with_local_fallback(context, strict_index, local
             "touches_boundary": touches,
             "passes": not touches or binding["known_source_count"] >= 2})
     audit["allow"] = any(binding["passes"] for binding in audit["bindings"])
-    audit["reason"] = "at_least_one_binding_passes" if audit["allow"] else "all_local_bindings_fail_g5_any"
+    audit["reason"] = "at_least_one_binding_passes" if audit["allow"] else "all_local_bindings_fail_g5"
     if local_gate == "g5_kinematic_boundary_v1" and audit["allow"]:
         audit = evaluate_g5_kinematic_boundary_gate(
             context,
@@ -629,7 +706,16 @@ def retrieve_mapping_experience_with_local_fallback(context, strict_index, local
             v_stop_mps=v_stop_mps,
         )
     if audit["allow"]:
-        return {**local_result, "g5_gate": audit, "local_declined": False}
+        from utils.fixed_expert_recovery import format_mapping_experience_context
+        filtered_payload = _filter_payload_by_passing_bindings(local["payload"], audit["bindings"])
+        filtered_gate = gate_mapping_experience(context, filtered_payload)
+        if filtered_gate["inject"]:
+            filtered_block = format_mapping_experience_context(filtered_payload)
+            filtered_audit = {**copy.deepcopy(local["audit"]), "characters": len(filtered_block)}
+            return {**local_result, "payload": filtered_payload, "audit": filtered_audit,
+                    "gate": filtered_gate, "g5_gate": audit, "local_declined": False}
+        audit["allow"] = False
+        audit["reason"] = "no_passing_trigger_bindings_after_elementwise_filter"
     return {**strict, "gate": strict_gate, "strict_gate": strict_gate["audit"],
             "fallback_used": True, "selection_scope": "strict_after_g5_local_decline",
             "g5_gate": audit, "local_declined": True,
@@ -746,82 +832,3 @@ def gate_mapping_experience(context, payload):
     inject = bool(audit["trigger_bindings"])
     audit["reason"] = "supported_nonprior_current_direction" if inject else "no_conflict_free_nonprior_direction_support"
     return {"inject": inject, "audit": audit}
-
-
-class FixedRetriever:
-    """Reuse frozen expert library snapshots for structural candidate recall."""
-
-    def __init__(self, data, config=None, road_graph=None, camera_to_node=None,
-                 model=None, scaler=None):
-        from utils.trajectory_features import FeatureScaler
-        self.data = normalize_library(data)
-        self.config = dict(config or {})
-        self.mode = self.config.get("mode", "structural_similarity")
-        if self.mode not in MODES:
-            raise ValueError(f"Unknown retrieval mode: {self.mode}")
-        self.road_graph, self.camera_to_node = road_graph, camera_to_node
-        self.model = model
-        self.scaler = scaler
-        if self.scaler is None and self.config.get("scaler_file"):
-            self.scaler = FeatureScaler.from_dict(json.loads(
-                Path(self.config["scaler_file"]).read_text(encoding="utf-8")))
-        if self.mode == "structural_similarity" and self.scaler is None:
-            raise ValueError("Structural retrieval requires a scaler fitted on training data")
-        self.score_type = {"random": "random", "none": "none"}.get(self.mode, "similarity")
-        self.last_retrieval_info = {}
-
-    def signature(self, camera_trace):
-        from utils.trajectory_features import build_signature
-        return build_signature(camera_trace, self.road_graph, self.camera_to_node)
-
-    def _signature_case(self, case):
-        from utils.trajectory_features import FEATURE_SCHEMA
-        signature = case.get("signature", {})
-        # Preserve explicitly prepared structural signatures when deployed without reloading the road graph.
-        if signature.get("feature_schema") == list(FEATURE_SCHEMA):
-            return signature
-        return self.signature(case["camera_trace"])
-
-    def structural_rank(self, signature, cases):
-        from utils.trajectory_features import structural_similarity
-        ranked = []
-        for case in cases:
-            csig = self._signature_case(case)
-            score = structural_similarity(signature, csig, self.scaler)
-            if score is not None and math.isfinite(score):
-                ranked.append((score, case))
-        return sorted(ranked, key=lambda x: (-x[0], x[1]["case_id"]))
-
-    def retrieve(self, query_cam_trace, topk=1, query_id=None, source_group_id=None):
-        """Recall and rank candidates strictly from current observations."""
-        self.last_retrieval_info = {"candidate_ids": [], "candidate_scores": [],
-                                    "selected_ids": [], "score_type": self.score_type,
-                                    "threshold": None}
-        if topk <= 0 or self.mode == "none":
-            return []
-        cases = eligible_cases(self.data["cases"], query_id, source_group_id, query_cam_trace)
-        if not cases:
-            return []
-        if self.mode == "random":
-            seed = digest([self.config.get("seed", 0), query_cam_trace])
-            shuffled = list(cases)
-            random.Random(seed).shuffle(shuffled)
-            ranked = [(1.0, c) for c in shuffled]
-        else:
-            signature = self.signature(query_cam_trace)
-            ranked = self.structural_rank(signature, cases)
-            count = int(self.config.get("candidate_count", 20))
-            if count < 1:
-                raise ValueError("candidate_count must be positive")
-            candidates = cases if self.config.get("all_cases", False) else [c for _, c in ranked[:count]]
-            candidate_ids = {c["case_id"] for c in candidates}
-            self.last_retrieval_info["candidate_ids"] = [c["case_id"] for c in candidates]
-            self.last_retrieval_info["structural_scores"] = [
-                {"case_id": c["case_id"], "score": float(s)} for s, c in ranked if c["case_id"] in candidate_ids]
-            ranked = [(s, c) for s, c in ranked if c["case_id"] in candidate_ids]
-            self.last_retrieval_info["candidate_scores"] = self.last_retrieval_info["structural_scores"]
-        if self.mode != "random":
-            ranked.sort(key=lambda x: (-x[0], x[1]["case_id"]))
-        selected = ranked[:topk]
-        self.last_retrieval_info["selected_ids"] = [c["case_id"] for _, c in selected]
-        return selected

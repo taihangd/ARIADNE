@@ -1,16 +1,16 @@
-# Road-Network Trajectory Recovery via Constrained LLM Reasoning and Difficulty-Aware Query Routing
+# ARIADNE: Grounded and Selective LLM Reasoning for Cross-Camera Trajectory Recovery
 
-Reference implementation and supplementary material for the paper *"Road-Network Trajectory Recovery via Constrained LLM Reasoning and Difficulty-Aware Query Routing"*.
+Reference implementation and supplementary material for the paper *"ARIADNE: Grounded and Selective LLM Reasoning for Cross-Camera Trajectory Recovery"*.
 
 ## Supplementary Material
 
-- **[`supplementary_material.pdf`](supplementary_material.pdf)**: Technical appendix accompanying the paper.
+- **[`supplementary_material.pdf`](supplementary_material.pdf)**: Supplementary material (extended multi-split tables, bootstrap confidence intervals, and multi-seed evaluations) accompanying the paper.
 
 ## Repository Structure
 
 ```text
 .
-├── supplementary_material.pdf # Technical appendix
+├── supplementary_material.pdf # Supplementary material
 ├── main.py                    # Main trajectory recovery pipeline
 ├── multi_llm_router.py        # Difficulty-aware multi-LLM router
 ├── traj_rec_st_cot.py         # LLM client and structured road-intent interface
@@ -31,13 +31,11 @@ Reference implementation and supplementary material for the paper *"Road-Network
    pip install -r requirements.txt
    ```
 
-2. Set provider API keys and update dataset paths in [`config/uv.yaml`](config/uv.yaml) or [`config/carla.yaml`](config/carla.yaml):
+2. Set dataset and model paths in [`config/uv.yaml`](config/uv.yaml) or [`config/carla.yaml`](config/carla.yaml).
+
+3. Run trajectory recovery:
    ```bash
    export OPENAI_API_KEY="your-openai-api-key"
    export DASHSCOPE_API_KEY="your-dashscope-api-key"
-   ```
-
-3. Run the recovery pipeline:
-   ```bash
    python3 main.py --cfg_file config/uv.yaml --allow-api
    ```

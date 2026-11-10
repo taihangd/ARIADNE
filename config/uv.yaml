@@ -15,6 +15,7 @@ cid_rid_correspondence_file: "./cache_data/uv/cid_rid_correspondence.pkl"
 rid_shortest_path_results_file: "./cache_data/uv/rid_shortest_path_result.pkl"
 cam_xy_dict_file: "./cache_data/uv/cam_xy_dict.pkl"
 road_node_traj_gt_file: "./cache_data/uv/traj_gt.pkl"
+experience_bank_file: "./cache_data/uv/experience_bank.pkl"
 
 # Upstream clustering
 sig_cluster:
@@ -47,7 +48,7 @@ llm_client:
     dashscope:
       api_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
       api_key: "${DASHSCOPE_API_KEY}"
-  default_model: "qwen3.5-plus"
+  default_model: "gpt-4.1-nano"
   default_temperature: 0.0
   default_max_tokens: 8192
   max_tokens_cap: 8192
