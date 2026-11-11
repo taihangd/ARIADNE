@@ -296,7 +296,7 @@ class PerformanceAwareMultiLLMRouter:
     ):
         """Filter candidate APIs within delta of the best predicted F1, then select the one with the lowest predicted latency.
 
-        When gate_aware=True (Section III-C1, Eq. 7), clusters whose C1 retrieval gate abstains
+        When gate_aware=True (Section III-C, Eq. 3), clusters whose C1 retrieval gate abstains
         (gate_accepted=False or retrieval_count == 0) are dispatched directly to fast_model
         (or default_model), while gate-accepted clusters are routed via the GBR Pareto selector.
         """

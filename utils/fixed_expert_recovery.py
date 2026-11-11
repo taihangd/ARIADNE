@@ -332,7 +332,7 @@ def build_cluster_corridor_subgraph(
     shortest_paths=None,
     k_hop=0,
 ):
-    """Construct the local corridor subgraph G_q subset G for a cluster query (Section III-C2, Eq. 8).
+    """Construct the local corridor subgraph G_q subset G for a cluster query (Section III-C, Eq. 4).
 
     Args:
         context: Either a cluster track context dict or a raw camera_trace list [(cam_id, ts), ...].
@@ -340,9 +340,9 @@ def build_cluster_corridor_subgraph(
         extra_nodes: Optional iterable of extra road-node IDs (e.g., via_nodes) to include.
         sp_cache: Optional dict caching shortest-path node sequences.
         pair_scope: "consecutive_only" (I_q = {(i, i+1)}), "consecutive_and_two_hop"
-            (I_q = {(i, i+1)} U {(i, i+2)} as defined in Eq. 8), or "all_forward" (all j > i).
+            (I_q = {(i, i+1)} U {(i, i+2)} as defined in Eq. 4), or "all_forward" (all j > i).
         camera_to_node: Optional mapping {camera_id: road_node_id} when context is a camera_trace.
-        camera_candidates: Optional mapping {camera_id: [cand_node_1, cand_node_2]} (Top-2 candidates Gamma_2(c_i)).
+        camera_candidates: Optional mapping {camera_id: [cand_node_1, cand_node_2]} (Top-2 candidates Gamma(c_i)).
         shortest_paths: Optional precomputed shortest-path dict {(u, v): (nodes, cum_lengths, total_len)}.
         k_hop: Optional neighborhood expansion radius around corridor nodes (default 0; 1 adds N_1).
     """
@@ -502,7 +502,7 @@ def evaluate_cluster_invocation_gate(
     detour_excess_m=0.0,
     candidate_bindings=None,
 ):
-    """Evaluate C1 Level-1 cluster invocation gate (gamma_inv in Section III-A1).
+    """Evaluate C1 Level-1 cluster invocation gate (Section III-A).
 
     Checks whether the raw camera observation sequence exhibits any of the three conditions:
     (a) Inter-observation topological/kinematic conflict:
@@ -653,7 +653,7 @@ def execute_three_tier_corridor_verification(
     max_expansions=200000,
     dijkstra_timeout_sec=2.0,
 ):
-    """Execute C2 three-tier deterministic corridor verification and timestamp interpolation (Section III-B2, Eq. 5).
+    """Execute C2 three-tier deterministic corridor verification and timestamp interpolation (Section III-B).
 
     Args:
         observations: List of (road_node_id, timestamp_sec) tuples representing anchor observations.
@@ -930,7 +930,7 @@ def extract_kinematic_dp_corridors(
     dwell_merge_sec=45.0,
     min_raw_support=4,
 ):
-    """Separate kinematically consistent single-vehicle sub-corridors via two-stage DP (Section III-B1).
+    """Separate kinematically consistent single-vehicle sub-corridors via two-stage DP (Section III-B).
 
     Extracts smooth local chains (d_SP <= local_dist_m), stitches compatible non-overlapping
     subchains (d_SP <= stitch_dist_m), and collapses consecutive same-node dwell detections

@@ -31,7 +31,7 @@ from utils.yaml_config_hook import add_config_arguments, flatten_dict, unflatten
 
 
 def _build_top2_camera_candidates(road_graph, cam_xy_dict, camera_ids):
-    """Compute geometric Top-2 candidate road nodes Gamma_2(c_i) per camera (Section II-A, Section III-C2)."""
+    """Compute geometric Top-2 candidate road nodes Gamma(c_i) per camera (Section II-A, Section III-C)."""
     if not isinstance(cam_xy_dict, dict) or road_graph is None:
         return None
     node_xy = [
@@ -241,6 +241,8 @@ def recover_cluster_trajectory(
     detour_excess_m: float = 0.0,
     enable_dp_corridor_separation: bool = False,
     max_intersection_cam_id: int | None = None,
+    v_stop_mps: float | None = None,
+    local_gate: str | None = None,
 ) -> Dict[str, Any]:
     """Execute the closed-loop C1 -> C3 -> C2 trajectory recovery pipeline (Algorithm 1)."""
     active_mapping = dict(camera_to_node or {})
@@ -266,7 +268,7 @@ def recover_cluster_trajectory(
         ]
         rid_trace = sorted(merge_tm_adj_points(rid_trace, adj_range=dwell_adj), key=lambda x: x[1])
 
-    # Stage 1 (C1): Evaluate experience bank B(O_q) (if supplied) and invocation gate gamma_inv(O_q)
+    # Stage 1 (C1): Evaluate experience bank E_bank (if supplied) and cluster-level kinematic gate (Section III-A)
     retrieval_report = None
     active_experience = retrieved_experience
     active_gate_accepted = bool(gate_accepted) or (active_experience is not None)
@@ -285,10 +287,10 @@ def recover_cluster_trajectory(
                 experience_bank["local_index"],
                 source_eligible_ids=experience_bank.get("source_eligible_ids", list(local_cases.keys())),
                 candidate_rows=experience_bank.get("candidate_rows", []),
-                local_gate=experience_bank.get("local_gate", "g5_kinematic_boundary_v1"),
+                local_gate=str(local_gate if local_gate is not None else experience_bank.get("local_gate", "g5_kinematic_boundary_v1")),
                 road_graph=road_graph,
                 teacher_kinematics_index=experience_bank.get("teacher_kinematics_index", {}),
-                v_stop_mps=float(experience_bank.get("v_stop_mps", 5.0)),
+                v_stop_mps=float(v_stop_mps if v_stop_mps is not None else experience_bank.get("v_stop_mps", 5.0)),
                 exclude_source_group=query_source_group,
             )
             if retrieval_report.get("gate", {}).get("inject") is True:
@@ -574,6 +576,8 @@ def run_pipeline(args) -> Dict[str, Any]:
     ckpt_file = routing_cfg.get("router_ckpt_file")
     if ckpt_file and os.path.exists(ckpt_file):
         router, _ = PerformanceAwareMultiLLMRouter.load(ckpt_file)
+        router.delta = quality_tolerance
+        router.default_model = default_model
 
     experience_bank = None
     bank_file = getattr(args, "experience_bank_file", "")
@@ -596,6 +600,8 @@ def run_pipeline(args) -> Dict[str, Any]:
     enable_dp_sep = bool(getattr(args, "enable_dp_corridor_separation", False))
     max_inter_cam = getattr(args, "max_intersection_cam_id", None)
     max_inter_cam = None if max_inter_cam is None else int(max_inter_cam)
+    v_stop_cfg = getattr(args, "v_stop_mps", None)
+    local_gate_cfg = getattr(args, "local_gate", None)
 
     for cid, raw_trace in sorted(cluster_cam_traces.items()):
         outcome = recover_cluster_trajectory(
@@ -615,6 +621,8 @@ def run_pipeline(args) -> Dict[str, Any]:
             detour_excess_m=detour_excess,
             enable_dp_corridor_separation=enable_dp_sep,
             max_intersection_cam_id=max_inter_cam,
+            v_stop_mps=v_stop_cfg,
+            local_gate=local_gate_cfg,
         )
         recovered_traj_dict[cid] = outcome["trajectory"]
 
